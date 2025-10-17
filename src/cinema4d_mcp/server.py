@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Union
 from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP, Context
-from starlette.routing import Route
 from starlette.responses import JSONResponse
 
 from .config import C4D_HOST, C4D_PORT
@@ -143,6 +142,35 @@ def send_to_c4d(connection: C4DConnection, command: Dict[str, Any]) -> Dict[str,
         return {"error": f"Communication error: {str(e)}"}
 
 
+def format_tool_output(
+    title: str,
+    details: List[str],
+    response: Optional[Any] = None,
+    include_json: bool = True,
+) -> str:
+    """Format tool output as markdown with optional JSON details."""
+    parts: List[str] = []
+
+    if title:
+        parts.append(f"# {title}")
+
+    if details:
+        parts.extend(details)
+
+    if include_json and response is not None:
+        try:
+            json_text = json.dumps(response, indent=2)
+        except (TypeError, ValueError):
+            json_text = str(response)
+
+        parts.append("")
+        parts.append("```json")
+        parts.extend(json_text.splitlines())
+        parts.append("```")
+
+    return "\n".join(parts).strip()
+
+
 async def homepage(request):
     """Handle homepage requests to check if server is running."""
     c4d_available = check_c4d_connection(C4D_HOST, C4D_PORT)
@@ -156,8 +184,11 @@ async def homepage(request):
     )
 
 
-# Initialize our FastMCP server
-mcp = FastMCP(title="Cinema4D", routes=[Route("/", endpoint=homepage)])
+# Initialize our FastMCP server (FastMCP now uses `name` and `custom_route`)
+mcp = FastMCP(name="Cinema4D")
+
+# Register homepage route using FastMCP's custom route decorator API
+mcp.custom_route("/", methods=["GET"])(homepage)
 
 
 @mcp.tool()
@@ -227,7 +258,30 @@ async def add_primitive(
             return f"❌ Error: {response['error']}"
 
         object_info = response.get("object", {})
-        return response
+        name_display = (
+            object_info.get("actual_name")
+            or object_info.get("requested_name")
+            or name
+            or primitive_type.capitalize()
+        )
+
+        summary = [
+            f"- **Name**: {name_display}",
+            f"- **Type**: {object_info.get('type', primitive_type)}",
+        ]
+
+        guid = object_info.get("guid")
+        if guid:
+            summary.append(f"- **GUID**: {guid}")
+
+        position_info = object_info.get("position") or position
+        if position_info:
+            summary.append(f"- **Position**: {position_info}")
+
+        if size:
+            summary.append(f"- **Requested Size**: {size}")
+
+        return format_tool_output("Primitive Created", summary, response)
 
 
 @mcp.tool()
@@ -258,12 +312,16 @@ async def modify_object(
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        # Generate summary of what was modified
-        modified_props = []
+        modified_props: List[str] = []
         for prop, value in properties.items():
-            modified_props.append(f"- **{prop}**: {value}")
+            modified_props.append(f"  - **{prop}**: {value}")
 
-        return response
+        summary = [f"- **Object**: {object_name}"]
+        if modified_props:
+            summary.append("- **Updated Properties:**")
+            summary.extend(modified_props)
+
+        return format_tool_output("Object Updated", summary, response)
 
 
 @mcp.tool()
@@ -282,14 +340,13 @@ async def list_objects(ctx: Context) -> str:
         if not objects:
             return "No objects found in the scene."
 
-        # Format objects as a hierarchical list with indentation
-        object_list = []
-        for obj in objects:
-            # Calculate indentation based on object's depth in hierarchy
-            indent = "  " * obj.get("depth", 0)
-            object_list.append(f"{indent}- **{obj['name']}** ({obj['type']})")
+        object_lines = [f"- **Total Objects**: {len(objects)}", "- **Hierarchy:**"]
 
-        return response
+        for obj in objects:
+            indent = "  " * obj.get("depth", 0)
+            object_lines.append(f"{indent}- **{obj['name']}** ({obj['type']})")
+
+        return format_tool_output("Scene Objects", object_lines, response)
 
 
 @mcp.tool()
@@ -326,7 +383,23 @@ async def create_material(
             return f"❌ Error: {response['error']}"
 
         material_info = response.get("material", {})
-        return response
+        requested = material_info.get("requested_name", name)
+        actual = material_info.get("actual_name", requested)
+        mat_type = material_info.get("type", properties.get("material_type", "standard"))
+
+        summary = [
+            f"- **Requested Name**: {requested}",
+            f"- **Actual Name**: {actual}",
+            f"- **Type**: {mat_type}",
+        ]
+
+        final_color = material_info.get("color_set")
+        if final_color:
+            summary.append(f"- **Color**: {final_color}")
+        elif color:
+            summary.append(f"- **Requested Color**: {color}")
+
+        return format_tool_output("Material Created", summary, response)
 
 
 @mcp.tool()
@@ -355,7 +428,24 @@ async def apply_material(material_name: str, object_name: str, ctx: Context) -> 
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        return response
+        summary = [
+            f"- **Material**: {response.get('material_name', material_name)}",
+            f"- **Object**: {response.get('object_name', object_name)}",
+        ]
+
+        projection = response.get("projection")
+        if projection:
+            summary.append(f"- **Projection**: {projection}")
+
+        object_guid = response.get("object_guid")
+        if object_guid:
+            summary.append(f"- **Object GUID**: {object_guid}")
+
+        message = response.get("message")
+        if message:
+            summary.insert(0, f"- {message}")
+
+        return format_tool_output("Material Applied", summary, response)
 
 
 @mcp.tool()
@@ -394,7 +484,30 @@ async def render_frame(
             return f"❌ Error: {response['error']}"
 
         render_info = response.get("render_info", {})
-        return response
+        summary = []
+
+        if render_info:
+            frame = render_info.get("frame")
+            if frame is not None:
+                summary.append(f"- **Frame**: {frame}")
+
+            resolution = render_info.get("resolution")
+            if resolution:
+                summary.append(f"- **Resolution**: {resolution}")
+
+            output = render_info.get("output_path", output_path)
+            if output:
+                summary.append(f"- **Output Path**: {output}")
+
+            duration = render_info.get("render_time")
+            if duration is not None:
+                summary.append(f"- **Render Time**: {duration} s")
+
+            success = render_info.get("success")
+            if success is not None:
+                summary.insert(0, f"- **Success**: {success}")
+
+        return format_tool_output("Frame Rendered", summary, response)
 
 
 @mcp.tool()
@@ -429,7 +542,14 @@ async def set_keyframe(
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        return response
+        summary = [
+            f"- **Object**: {object_name}",
+            f"- **Property**: {property_name}",
+            f"- **Value**: {value}",
+            f"- **Frame**: {frame}",
+        ]
+
+        return format_tool_output("Keyframe Created", summary, response)
 
 
 @mcp.tool()
@@ -456,7 +576,15 @@ async def save_scene(file_path: Optional[str] = None, ctx: Context = None) -> st
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        return response
+        summary = []
+        if file_path:
+            summary.append(f"- **Path**: {file_path}")
+
+        message = response.get("message")
+        if message:
+            summary.insert(0, f"- {message}")
+
+        return format_tool_output("Scene Saved", summary, response)
 
 
 @mcp.tool()
@@ -479,7 +607,14 @@ async def load_scene(file_path: str, ctx: Context) -> str:
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        return response
+        summary = [f"- **Scene Loaded**: {file_path}"]
+
+        recent_objects = response.get("objects_loaded")
+        if isinstance(recent_objects, list) and recent_objects:
+            summary.append("- **Objects Loaded:**")
+            summary.extend([f"  - {obj}" for obj in recent_objects[:10]])
+
+        return format_tool_output("Scene Loaded", summary, response)
 
 
 @mcp.tool()
@@ -508,7 +643,22 @@ async def create_mograph_cloner(
             return f"❌ Error: {response['error']}"
 
         object_info = response.get("object", {})
-        return response
+        name_display = (
+            object_info.get("actual_name")
+            or object_info.get("requested_name")
+            or name
+            or cloner_type.capitalize()
+        )
+        summary = [
+            f"- **Cloner**: {name_display}",
+            f"- **Mode**: {object_info.get('mode', cloner_type)}",
+        ]
+
+        guid = object_info.get("guid")
+        if guid:
+            summary.append(f"- **GUID**: {guid}")
+
+        return format_tool_output("MoGraph Cloner Created", summary, response)
 
 
 @mcp.tool()
@@ -544,7 +694,26 @@ async def add_effector(
             return f"❌ Error: {response['error']}"
 
         object_info = response.get("object", {})
-        return response
+        effector_name = (
+            object_info.get("actual_name")
+            or object_info.get("requested_name")
+            or name
+            or effector_type.capitalize()
+        )
+
+        summary = [
+            f"- **Effector**: {effector_name}",
+            f"- **Type**: {object_info.get('type', effector_type)}",
+        ]
+
+        if target:
+            summary.append(f"- **Target**: {target}")
+
+        guid = object_info.get("guid")
+        if guid:
+            summary.append(f"- **GUID**: {guid}")
+
+        return format_tool_output("Effector Added", summary, response)
 
 
 @mcp.tool()
@@ -596,18 +765,30 @@ async def apply_mograph_fields(
         # Extract field info from response
         field_info = response.get("field", {})
 
-        # Build a response message
-        field_name = field_info.get("name", f"{field_type.capitalize()} Field")
-        applied_to = field_info.get("applied_to", "None")
+        field_label = field_info.get("name", f"{field_type.capitalize()} Field")
+        applied_to = field_info.get("applied_to")
 
-        # Additional parameters if available
-        params_info = ""
-        if "strength" in field_info:
-            params_info += f"\n- **Strength**: {field_info.get('strength')}"
-        if "falloff" in field_info:
-            params_info += f"\n- **Falloff**: {field_info.get('falloff')}"
+        summary = [
+            f"- **Field**: {field_label}",
+            f"- **Type**: {field_info.get('type', field_type)}",
+        ]
 
-        return response
+        if applied_to:
+            summary.append(f"- **Applied To**: {applied_to}")
+
+        strength = field_info.get("strength")
+        if strength is not None:
+            summary.append(f"- **Strength**: {strength}")
+
+        falloff = field_info.get("falloff")
+        if falloff is not None:
+            summary.append(f"- **Falloff**: {falloff}")
+
+        guid = field_info.get("guid")
+        if guid:
+            summary.append(f"- **GUID**: {guid}")
+
+        return format_tool_output("Field Applied", summary, response)
 
 
 @mcp.tool()
@@ -629,7 +810,25 @@ async def create_soft_body(object_name: str, ctx: Context = None) -> str:
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        return response
+        body_info = response.get("soft_body", {})
+        summary = [
+            f"- **Object**: {body_info.get('object_name', object_name)}",
+            "- **Dynamics**: Soft Body applied",
+        ]
+
+        stiffness = body_info.get("stiffness_set")
+        if stiffness is not None:
+            summary.append(f"- **Stiffness**: {stiffness}")
+
+        mass = body_info.get("mass_set")
+        if mass is not None:
+            summary.append(f"- **Mass**: {mass}")
+
+        guid = body_info.get("object_guid")
+        if guid:
+            summary.append(f"- **Object GUID**: {guid}")
+
+        return format_tool_output("Soft Body Created", summary, response)
 
 
 @mcp.tool()
@@ -659,7 +858,21 @@ async def apply_dynamics(
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        return response
+        dynamics_info = response.get("dynamics", {})
+        summary = [
+            f"- **Object**: {dynamics_info.get('object_name', object_name)}",
+            f"- **Dynamics Type**: {dynamics_info.get('tag_type_applied', dynamics_type)}",
+        ]
+
+        tag_name = dynamics_info.get("tag_name")
+        if tag_name:
+            summary.append(f"- **Tag**: {tag_name}")
+
+        guid = dynamics_info.get("object_guid")
+        if guid:
+            summary.append(f"- **Object GUID**: {guid}")
+
+        return format_tool_output("Dynamics Applied", summary, response)
 
 
 @mcp.tool()
@@ -688,7 +901,20 @@ async def create_abstract_shape(
             return f"❌ Error: {response['error']}"
 
         object_info = response.get("object", {})
-        return response
+        summary = [
+            f"- **Shape**: {object_info.get('actual_name', object_info.get('requested_name', name or shape_type.capitalize()))}",
+            f"- **Type**: {object_info.get('type', shape_type)}",
+        ]
+
+        guid = object_info.get("guid")
+        if guid:
+            summary.append(f"- **GUID**: {guid}")
+
+        position_info = object_info.get("position")
+        if position_info:
+            summary.append(f"- **Position**: {position_info}")
+
+        return format_tool_output("Abstract Shape Created", summary, response)
 
 
 @mcp.tool()
@@ -697,7 +923,7 @@ async def create_camera(
     position: Optional[List[float]] = None,
     properties: Optional[Dict[str, Any]] = None,
     ctx: Context = None,
-) -> Dict[str, Any]:
+) -> str:
     """
     Create a new camera in the scene.
 
@@ -711,8 +937,7 @@ async def create_camera(
 
     async with c4d_connection_context() as connection:
         if not connection.connected:
-            # Return error as dictionary for consistency
-            return {"error": "❌ Not connected to Cinema 4D"}
+            return "❌ Not connected to Cinema 4D"
 
         command = {"command": "create_camera"}
         if requested_name:
@@ -726,7 +951,34 @@ async def create_camera(
 
         response = send_to_c4d(connection, command)
 
-        return response
+        if "error" in response:
+            return f"❌ Error: {response['error']}"
+
+        camera_info = response.get("camera", {})
+        summary = [
+            f"- **Requested Name**: {camera_info.get('requested_name', requested_name)}",
+            f"- **Actual Name**: {camera_info.get('actual_name', requested_name)}",
+        ]
+
+        guid = camera_info.get("guid")
+        if guid:
+            summary.append(f"- **GUID**: {guid}")
+
+        position_info = camera_info.get("position") or position
+        if position_info:
+            summary.append(f"- **Position**: {position_info}")
+
+        rotation_info = camera_info.get("rotation")
+        if rotation_info:
+            summary.append(f"- **Rotation (deg)**: {rotation_info}")
+
+        props_applied = camera_info.get("properties_applied")
+        if props_applied:
+            summary.append("- **Properties Applied:**")
+            for prop, val in props_applied.items():
+                summary.append(f"  - **{prop}**: {val}")
+
+        return format_tool_output("Camera Created", summary, response)
 
 
 @mcp.tool()
@@ -755,7 +1007,16 @@ async def create_light(
             return f"❌ Error: {response['error']}"
 
         object_info = response.get("object", {})
-        return response
+        summary = [
+            f"- **Light**: {object_info.get('actual_name', object_info.get('requested_name', name or light_type.capitalize()))}",
+            f"- **Type**: {object_info.get('type', light_type)}",
+        ]
+
+        guid = object_info.get("guid")
+        if guid:
+            summary.append(f"- **GUID**: {guid}")
+
+        return format_tool_output("Light Created", summary, response)
 
 
 @mcp.tool()
@@ -791,11 +1052,20 @@ async def apply_shader(
             return f"❌ Error: {response['error']}"
 
         shader_info = response.get("shader", {})
-        material_name = shader_info.get("material", "New Material")
-        applied_to = shader_info.get("applied_to", "None")
-        applied_msg = f" and applied to '{applied_to}'" if applied_to != "None" else ""
+        summary = [
+            f"- **Shader**: {shader_info.get('shader', shader_type)}",
+            f"- **Material**: {shader_info.get('material', material_name or 'New Material')}",
+        ]
 
-        return response
+        applied_to = shader_info.get("applied_to")
+        if applied_to:
+            summary.append(f"- **Applied To**: {applied_to}")
+
+        message = response.get("message")
+        if message:
+            summary.insert(0, f"- {message}")
+
+        return format_tool_output("Shader Applied", summary, response)
 
 
 @mcp.tool()
@@ -866,21 +1136,34 @@ async def animate_camera(
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        # Get the camera animation info
         camera_info = response.get("camera_animation", {})
+        summary = [
+            f"- **Camera**: {camera_info.get('actual_name', camera_name or 'Camera')}",
+            f"- **Path Type**: {camera_info.get('path_type', animation_type)}",
+        ]
 
-        # Build a response message
-        frames_info = ""
-        if "frame_range" in camera_info:
-            frames_info = (
-                f"\n- **Frame Range**: {camera_info.get('frame_range', [0, 0])}"
-            )
+        keyframes = camera_info.get("keyframe_count")
+        if keyframes is not None:
+            summary.append(f"- **Keyframes**: {keyframes}")
 
-        keyframe_info = ""
-        if "keyframe_count" in camera_info:
-            keyframe_info = f"\n- **Keyframes**: {camera_info.get('keyframe_count', 0)}"
+        frame_range = camera_info.get("frame_range_set") or camera_info.get(
+            "frame_range"
+        )
+        if frame_range:
+            summary.append(f"- **Frame Range**: {frame_range}")
 
-        return response
+        if camera_info.get("camera_created"):
+            summary.append("- **Camera Created**: True")
+
+        path_guid = camera_info.get("spline_path_guid")
+        if path_guid:
+            summary.append(f"- **Spline Path GUID**: {path_guid}")
+
+        guid = camera_info.get("guid")
+        if guid:
+            summary.append(f"- **Camera GUID**: {guid}")
+
+        return format_tool_output("Camera Animated", summary, response)
 
 
 @mcp.tool()
@@ -904,7 +1187,12 @@ async def execute_python_script(script: str, ctx: Context) -> str:
             return f"❌ Error: {response['error']}"
 
         result = response.get("result", "No output")
-        return response
+        summary = [
+            "- **Script Executed**",
+            f"- **Result**: {result}",
+        ]
+
+        return format_tool_output("Python Script Executed", summary, response)
 
 
 @mcp.tool()
@@ -935,14 +1223,31 @@ async def group_objects(
             return f"❌ Error: {response['error']}"
 
         group_info = response.get("group", {})
+        summary = [
+            f"- **Group**: {group_info.get('actual_name', group_info.get('requested_name', group_name or 'Group'))}",
+            f"- **Members**: {len(group_info.get('children_actual_names', object_names))}",
+        ]
 
-        # Format object list for display
-        objects_str = ", ".join(object_names)
-        if len(objects_str) > 50:
-            # Truncate if too long
-            objects_str = objects_str[:47] + "..."
+        position_info = group_info.get("position")
+        if position_info:
+            summary.append(f"- **Position**: {position_info}")
 
-        return response
+        if group_info.get("centered"):
+            summary.append("- **Centered on Members**: True")
+
+        if group_info.get("kept_world_position") is False:
+            summary.append("- **World Position Maintained**: False")
+
+        guid = group_info.get("guid")
+        if guid:
+            summary.append(f"- **Group GUID**: {guid}")
+
+        warnings = response.get("warnings")
+        if warnings:
+            summary.append("- **Warnings:**")
+            summary.extend([f"  - {warn}" for warn in warnings])
+
+        return format_tool_output("Objects Grouped", summary, response)
 
 
 @mcp.tool()
@@ -983,21 +1288,29 @@ async def render_preview(
         if "error" in response:
             return f"❌ Error: {response['error']}"
 
-        # Check if the response contains the base64 image data
         if "image_data" not in response:
             return "❌ Error: No image data returned from Cinema 4D"
 
-        # Get image dimensions
         preview_width = response.get("width", width or "default")
         preview_height = response.get("height", height or "default")
-
-        # Display the image using markdown
-        image_data = response["image_data"]
+        image_data = response.get("image_data", "")
         image_format = response.get("format", "png")
 
-        # Note: The plugin handler handle_render_preview was already designed
-        # to return the structure needed for image display if successful.
-        return response  # Return the raw dictionary
+        summary = [
+            f"- **Resolution**: {preview_width} x {preview_height}",
+            f"- **Format**: {image_format}",
+            f"- **Image Size (base64)**: {len(image_data)} characters",
+        ]
+
+        if image_data:
+            snippet = image_data[:80] + ("…" if len(image_data) > 80 else "")
+            summary.append(f"- **Preview Snippet**: `{snippet}`")
+
+        sanitized = dict(response)
+        if isinstance(image_data, str) and len(image_data) > 120:
+            sanitized["image_data"] = image_data[:120] + "... (truncated)"
+
+        return format_tool_output("Render Preview", summary, sanitized)
 
 
 @mcp.tool()
@@ -1031,18 +1344,21 @@ async def snapshot_scene(
 
         snapshot_info = response.get("snapshot", {})
 
-        # Extract information
         path = snapshot_info.get("path", file_path or "Default location")
         size = snapshot_info.get("size", "Unknown")
         timestamp = snapshot_info.get("timestamp", "Unknown")
 
-        # Format assets information if available
-        assets_info = ""
-        if "assets" in snapshot_info:
-            assets_count = len(snapshot_info["assets"])
-            assets_info = f"\n- **Assets Included**: {assets_count}"
+        summary = [
+            f"- **Snapshot Path**: {path}",
+            f"- **Size**: {size}",
+            f"- **Timestamp**: {timestamp}",
+        ]
 
-        return response
+        assets = snapshot_info.get("assets")
+        if isinstance(assets, list):
+            summary.append(f"- **Assets Included**: {len(assets)}")
+
+        return format_tool_output("Scene Snapshot", summary, response)
 
 
 @mcp.resource("c4d://primitives")
